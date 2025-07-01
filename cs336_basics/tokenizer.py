@@ -4,6 +4,7 @@ import regex as re
 import multiprocessing as mp
 from collections import defaultdict, Counter
 from tqdm import tqdm
+import time
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 PAT_COMPILED = re.compile(PAT)
@@ -61,15 +62,19 @@ def pretokenize_chunks(args):
         pattern = "|".join(map(re.escape, special_tokens))
         chunks = re.split(pattern, raw_text)
 
-    byte_seqs = []
+    byte_seqs = defaultdict(int)
     for chunk in chunks:
         tokens = PAT_COMPILED.findall(chunk)
-        byte_seqs.extend([t.encode("utf-8") for t in tokens])
+        for token in tokens:
+            byte_seqs[token.encode("utf-8")] += 1
 
     return byte_seqs
 
 
 def bpe_train(input_path: str, vocab_size: int, special_tokens: list[str]):
+    print("Pretokenizing...")
+    start_time = time.time()
+
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, desired_num_chunks=8, split_special_token="<|endoftext|>".encode("utf-8"))
 
@@ -77,9 +82,18 @@ def bpe_train(input_path: str, vocab_size: int, special_tokens: list[str]):
     with mp.Pool(processes=8) as pool:
         results = pool.map(pretokenize_chunks, tasks)
 
-    all_byte_seqs = [b for byte_seqs in results for b in byte_seqs]
-    int_seqs = [list(b) for b in all_byte_seqs]
+    all_byte_seqs = defaultdict(int)
+    for byte_seqs in results:
+        for byte_seq, count in byte_seqs.items():
+            all_byte_seqs[byte_seq] += count
 
+    int_seqs = defaultdict(int)
+    for byte_seq, count in all_byte_seqs.items():
+        int_seqs[tuple(byte_seq)] = count
+
+    print(f"Pretokenization took {time.time() - start_time} seconds")
+
+    start_time = time.time()
     vocab = {i: bytes([i]) for i in range(256)}
     merges = []
     cur_index = 256
@@ -87,19 +101,20 @@ def bpe_train(input_path: str, vocab_size: int, special_tokens: list[str]):
         vocab[cur_index] = special_token.encode("utf-8")
         cur_index += 1
 
-    pair_freqs = Counter()
+    pair_freqs = defaultdict(int)
     for seq in int_seqs:
         for i in range(len(seq) - 1):
-            pair_freqs[(seq[i], seq[i + 1])] += 1
+            pair_freqs[(seq[i], seq[i + 1])] += int_seqs[tuple(seq)]
 
     pair_positions = defaultdict(Counter)
     for seq_idx, seq in enumerate(int_seqs):
         for i in range(len(seq) - 1):
-            pair_positions[(seq[i], seq[i + 1])][seq_idx] += 1
+            pair_positions[(seq[i], seq[i + 1])][seq_idx] += int_seqs[tuple(seq)]
 
     numberOfTokensToMerge = vocab_size - len(vocab)
 
     # Start training
+    int_seqs = list(int_seqs.items())
     for _ in tqdm(range(numberOfTokensToMerge), desc="Training BPE"):
         if not pair_freqs:
             print("No more pairs to merge. Stopping early.")
@@ -124,7 +139,7 @@ def bpe_train(input_path: str, vocab_size: int, special_tokens: list[str]):
                 continue
 
             changed_seqs[seq_idx] = True
-            seq = int_seqs[seq_idx]
+            seq, count = int_seqs[seq_idx]
 
             new_seq = []
             i = 0
@@ -133,45 +148,47 @@ def bpe_train(input_path: str, vocab_size: int, special_tokens: list[str]):
                 if i < len(seq) - 1 and seq[i] == token1 and seq[i + 1] == token2:
                     new_seq.append(cur_index)
                     if i > 0:
-                        pair_freqs[(seq[i - 1], cur_index)] += 1
-                        pair_positions[(seq[i - 1], cur_index)][seq_idx] += 1
+                        pair_freqs[(seq[i - 1], cur_index)] += count
+                        pair_positions[(seq[i - 1], cur_index)][seq_idx] += count
                     if i < len(seq) - 2:
-                        pair_freqs[(cur_index, seq[i + 2])] += 1
-                        pair_positions[(cur_index, seq[i + 2])][seq_idx] += 1
+                        pair_freqs[(cur_index, seq[i + 2])] += count
+                        pair_positions[(cur_index, seq[i + 2])][seq_idx] += count
 
                     if i > 0:
-                        pair_freqs[(seq[i - 1], seq[i])] -= 1
+                        pair_freqs[(seq[i - 1], seq[i])] -= count
 
                         if pair_positions[(seq[i - 1], seq[i])][seq_idx] > 0:
-                            pair_positions[(seq[i - 1], seq[i])][seq_idx] -= 1
+                            pair_positions[(seq[i - 1], seq[i])][seq_idx] -= count
 
                     if i < len(seq) - 2:
-                        pair_freqs[(seq[i + 1], seq[i + 2])] -= 1
+                        pair_freqs[(seq[i + 1], seq[i + 2])] -= count
                         if pair_positions[(seq[i + 1], seq[i + 2])][seq_idx] > 0:
-                            pair_positions[(seq[i + 1], seq[i + 2])][seq_idx] -= 1
+                            pair_positions[(seq[i + 1], seq[i + 2])][seq_idx] -= count
                     i += 2
                 else:
                     new_seq.append(seq[i])
                     i += 1
 
-            seq[:] = new_seq
+            int_seqs[seq_idx] = (new_seq, count)
 
         cur_index += 1
         pair_freqs[best_pair] = 0
         del pair_positions[best_pair]
 
-    print(merges)
-    # print(vocab)
+    print(f"Training BPE took {time.time() - start_time} seconds")
+    # print(merges)
     return vocab, merges
 
 
 # Main
 def main():
-    input_path = "../tests/fixtures/corpus.en"
-    vocab_size = 500
+    input_path = "../data/TinyStoriesV2-GPT4-train.txt"
+    vocab_size = 10000
     special_tokens = ["<|endoftext|>"]
 
-    bpe_train(input_path, vocab_size, special_tokens)
+    vocab, merges = bpe_train(input_path, vocab_size, special_tokens)
+    print("longest token length: ", max(len(token) for token in vocab.values()))
+    print("vocab size: ", len(vocab))
 
 
 if __name__ == "__main__":
