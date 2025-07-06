@@ -10,11 +10,13 @@ class RMSNorm(nn.Module):
         self.g = nn.Parameter(torch.randn(d_model, device=device, dtype=dtype)) # learnable parameter
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
         rms = self.RMS(x)
         rms_inv = 1 / rms
         x = einsum(x, rms_inv, '... seq_len d_model, ... seq_len -> ... seq_len d_model')
         x = einsum(x, self.g, '... seq_len d_model, d_model -> ... seq_len d_model')
-        return x
+        return x.to(in_dtype)
         
     def RMS(self, x: torch.Tensor): 
         return torch.sqrt(torch.mean(x ** 2, dim=2) + self.eps)
